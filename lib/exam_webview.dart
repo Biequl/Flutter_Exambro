@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/services.dart'; // Walaupun tidak dipakai langsung, ini ada di kode asli Anda
 import 'package:audioplayers/audioplayers.dart';
 import 'package:kiosk_mode/kiosk_mode.dart';
 import 'package:flutter_windowmanager_plus/flutter_windowmanager_plus.dart';
@@ -19,8 +19,6 @@ class _ExamWebViewState extends State<ExamWebView> with WidgetsBindingObserver {
   int _progress = 0;
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  bool _isFullscreen = false;
-  bool _isJsDialogOpen = false;
   bool _ignoreTemporaryPause = false;
 
   @override
@@ -41,9 +39,28 @@ class _ExamWebViewState extends State<ExamWebView> with WidgetsBindingObserver {
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (progress) => setState(() => _progress = progress),
-          onPageFinished: (url) => _injectSafeJS(),
+          onPageFinished: (url) =>
+              _injectSafeJS(), // Sekarang HANYA menginjeksi JS
         ),
       )
+      // --- PERBAIKAN: Channel didaftarkan di initState ---
+      ..addJavaScriptChannel(
+        'ExamAppChannel',
+        onMessageReceived: (msg) {
+          final event = msg.message;
+          debugPrint('ExamAppChannel Event: $event'); // Untuk debugging
+          if (event == 'fullscreen_enter' ||
+              event == 'js_dialog_open' ||
+              event == 'blur_event') {
+            _ignoreTemporaryPause = true;
+          } else if (event == 'fullscreen_exit' ||
+              event == 'js_dialog_close' ||
+              event == 'focus_event') {
+            _ignoreTemporaryPause = false;
+          }
+        },
+      )
+      // --- AKHIR PERBAIKAN ---
       ..loadRequest(Uri.parse(widget.url));
   }
 
@@ -82,25 +99,57 @@ class _ExamWebViewState extends State<ExamWebView> with WidgetsBindingObserver {
     }
   }
 
-  /// Injeksi JavaScript untuk mendeteksi fullscreen / dialog / blur-focus event
+  /// Injeksi JavaScript untuk memblokir fullscreen dan mendeteksi event
   Future<void> _injectSafeJS() async {
+    // --- PERBAIKAN: Kode JS lengkap untuk memblokir SEMUA varian fullscreen ---
     const js = '''
       (function() {
-        if (window.ExamAppChannel) return;
-        function notify(msg) { window.ExamAppChannel.postMessage(msg); }
+        // Mencegah injeksi ganda jika halaman navigasi internal
+        if (window.ExamAppChannelInjected) return;
+        window.ExamAppChannelInjected = true;
+        
+        function notify(msg) { 
+          if (window.ExamAppChannel) {
+            window.ExamAppChannel.postMessage(msg); 
+          } else {
+            console.log('ExamAppChannel not ready, message dropped: ' + msg);
+          }
+        }
 
-        // Deteksi event aman dari web
-        document.addEventListener('fullscreenchange', function() {
-          if (document.fullscreenElement) notify('fullscreen_enter');
-          else notify('fullscreen_exit');
-        });
+        // --- BLOKIR FULLSCREEN NATIVE (VERSI LENGKAP) ---
+        // Ini akan menimpa fungsi:
+        // requestFullscreen, mozRequestFullScreen, webkitRequestFullscreen, msRequestFullscreen
+        function blockFullscreen(name) {
+          Element.prototype[name] = function() {
+            console.log(name + ' request BLOCKED by Exambro');
+            notify('fullscreen_enter');
+          };
+        }
+        
+        blockFullscreen('requestFullscreen');
+        blockFullscreen('mozRequestFullScreen');
+        blockFullscreen('webkitRequestFullscreen');
+        blockFullscreen('msRequestFullscreen');
 
-        window.addEventListener('blur', function() {
-          notify('blur_event');
-        });
-        window.addEventListener('focus', function() {
-          notify('focus_event');
-        });
+        // Timpa juga fungsi exitFullscreen (di Document.prototype)
+        // Ini akan menimpa fungsi:
+        // exitFullscreen, mozCancelFullScreen, webkitExitFullscreen, msExitFullscreen
+        function blockExitFullscreen(name) {
+          Document.prototype[name] = function() {
+            console.log(name + ' BLOCKED by Exambro');
+            notify('fullscreen_exit');
+          };
+        }
+        
+        blockExitFullscreen('exitFullscreen');
+        blockExitFullscreen('mozCancelFullScreen');
+        blockExitFullscreen('webkitExitFullscreen');
+        blockExitFullscreen('msExitFullscreen');
+        // --- AKHIR BLOKIR ---
+
+        // Deteksi event aman (blur/focus/dialog)
+        window.addEventListener('blur', function() { notify('blur_event'); });
+        window.addEventListener('focus', function() { notify('focus_event'); });
 
         const nativeAlert = window.alert;
         const nativeConfirm = window.confirm;
@@ -125,22 +174,9 @@ class _ExamWebViewState extends State<ExamWebView> with WidgetsBindingObserver {
         };
       })();
     ''';
+    // --- AKHIR PERBAIKAN JS ---
 
     await _controller.runJavaScript(js);
-
-    _controller.addJavaScriptChannel(
-      'ExamAppChannel',
-      onMessageReceived: (msg) {
-        final event = msg.message;
-        if (event == 'fullscreen_enter' || event == 'js_dialog_open' || event == 'blur_event') {
-          _ignoreTemporaryPause = true;
-        } else if (event == 'fullscreen_exit' ||
-            event == 'js_dialog_close' ||
-            event == 'focus_event') {
-          _ignoreTemporaryPause = false;
-        }
-      },
-    );
   }
 
   @override
@@ -171,7 +207,7 @@ class _ExamWebViewState extends State<ExamWebView> with WidgetsBindingObserver {
             IconButton(
               icon: const Icon(Icons.exit_to_app),
               onPressed: () async {
-                await _audioPlayer.play(AssetSource('assets/alarm.wav'));
+                await _audioPlayer.play(AssetSource('alarm.wav'));
                 final keluar = await showDialog<bool>(
                   context: context,
                   builder: (ctx) => AlertDialog(
